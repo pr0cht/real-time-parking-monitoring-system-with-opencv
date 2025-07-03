@@ -12,7 +12,7 @@ vacant_sound = pygame.mixer.Sound("beep_vac.wav")   # Sound for vacancy when a c
 car_cascade = cv2.CascadeClassifier("cars.xml") # Load Haar Cascade for car detection
 
 dpg.create_context() # Initialize UI window
-with dpg.window(label="Parking Status", width=400, height=300):
+with dpg.window(label="Parking Status", width=400, height=500):
     dpg.add_text("Parking 01: Vacant", tag="parking1_status")
     dpg.add_text("Parking 02: Vacant", tag="parking2_status")
     dpg.add_text("Parking 03: Vacant", tag="parking3_status")
@@ -21,6 +21,14 @@ with dpg.window(label="Parking Status", width=400, height=300):
     dpg.add_separator()
     dpg.add_text("Parking Log:", tag="log_label")
     dpg.add_text("", tag="parking_log")
+    dpg.add_separator()
+    dpg.add_text("Detection Parameters")
+    dpg.add_slider_float(label="Scale Factor", tag="scale_factor", default_value=1.010, min_value=1.01, max_value=1.5, format="%.3f")
+    dpg.add_slider_int(label="Min Neighbors", tag="min_neighbors", default_value=3, min_value=1, max_value=10)
+    dpg.add_slider_int(label="History", tag="history", default_value=1000, min_value=100, max_value=2000)
+    dpg.add_slider_int(label="VarThreshold", tag="var_threshold", default_value=300, min_value=10, max_value=1000)
+    dpg.add_slider_int(label="Obstruction %", tag="obstruction_percent", default_value=30, min_value=5, max_value=90)
+    dpg.add_slider_int(label="Stabilization Frames", tag="stabilization_frames", default_value=15, min_value=1, max_value=60)
 dpg.create_viewport(title="Parking Scanner UI", width=600, height=300)
 dpg.setup_dearpygui()
 dpg.show_viewport()
@@ -71,7 +79,7 @@ detection_threshold = 10  # Threshold for detecting a car in the parking area
 
 # Initialize stabilization counters for each parking area
 stabilization_counters = {status_tag: {"Occupied": 0, "Obstructed": 0, "Vacant": 0} for _, _, status_tag in parking_areas}
-stabilization_threshold = 13  # Number of consecutive frames required to confirm a status change
+stabilization_threshold = 15  # Number of consecutive frames required to confirm a status change
 
 print("Press 's' anytime to set/update the reference frame. Press 'q' to quit.")
 
@@ -84,7 +92,7 @@ parking_end_time = {status_tag: None for _, _, status_tag in parking_areas}
 delay_counters = {status_tag: 0 for _, _, status_tag in parking_areas}  # Delay mechanism   
 
 # Initialize background subtractor
-bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=1000, varThreshold=250, detectShadows=False)
+bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=1000, varThreshold=300, detectShadows=False)
 
 log_messages = []
 
@@ -108,12 +116,31 @@ while dpg.is_dearpygui_running():
         dpg.render_dearpygui_frame()
         continue
 
+    # Get current parameter values from GUI
+    scale_factor = dpg.get_value("scale_factor")
+    min_neighbors = dpg.get_value("min_neighbors")
+    history = dpg.get_value("history")
+    var_threshold = dpg.get_value("var_threshold")
+    obstruction_percent = dpg.get_value("obstruction_percent")
+    stabilization_threshold = dpg.get_value("stabilization_frames")
+
+    # Update background subtractor if history or varThreshold changed
+    if (bg_subtractor.getHistory() != history) or (bg_subtractor.getVarThreshold() != var_threshold):
+        bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=history, varThreshold=var_threshold, detectShadows=False
+        )
+
     for i, (start, end, status_tag) in enumerate(parking_areas, start=1):     # Process each parking area
         parking = frame[start[1]:end[1], start[0]:end[0]]
 
-        # Detect cars in the parking area
+        # Use adjustable parameters in detection
         gray_parking = cv2.cvtColor(parking, cv2.COLOR_BGR2GRAY)
-        cars = car_cascade.detectMultiScale(gray_parking, scaleFactor=1.015, minNeighbors=5, minSize=(50, 50))
+        cars = car_cascade.detectMultiScale(
+            gray_parking,
+            scaleFactor=scale_factor,
+            minNeighbors=min_neighbors,
+            minSize=(30, 30)
+        )
 
         # Use background subtraction for obstruction detection
         fg_mask = bg_subtractor.apply(parking)
@@ -127,14 +154,13 @@ while dpg.is_dearpygui_running():
         total_pixels = thresh.shape[0] * thresh.shape[1]
         percent_change = (white_pixels / total_pixels) * 100
 
-        # Determine the current status
+        # Use adjustable obstruction threshold
         current_status = "Vacant"
         color = (0, 255, 0)
-
         if len(cars) > 0:
             current_status = "Occupied"
             color = (0, 0, 255)
-        elif percent_change > 30:  # Increase sensitivity threshold for obstruction
+        elif percent_change > obstruction_percent:
             current_status = "Obstructed"
             color = (0, 165, 255)
 

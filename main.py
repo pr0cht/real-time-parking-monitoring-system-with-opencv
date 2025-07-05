@@ -29,11 +29,16 @@ with dpg.window(label="Parking Status", width=400, height=500):
     dpg.add_slider_int(label="VarThreshold", tag="var_threshold", default_value=300, min_value=10, max_value=1000)
     dpg.add_slider_int(label="Obstruction %", tag="obstruction_percent", default_value=30, min_value=5, max_value=90)
     dpg.add_slider_int(label="Stabilization Frames", tag="stabilization_frames", default_value=15, min_value=1, max_value=60)
+    dpg.add_separator()
+    dpg.add_text("Camera Controls")
+    dpg.add_slider_float(label="Brightness", tag="cam_brightness", default_value=0.5, min_value=0.0, max_value=1.0)
+    dpg.add_slider_float(label="Contrast", tag="cam_contrast", default_value=0.5, min_value=0.0, max_value=1.0)
+    dpg.add_slider_float(label="Saturation", tag="cam_saturation", default_value=0.5, min_value=0.0, max_value=1.0)
 dpg.create_viewport(title="Parking Scanner UI", width=600, height=300)
 dpg.setup_dearpygui()
 dpg.show_viewport()
 
-cap = cv2.VideoCapture(0) # Camera Index
+cap = cv2.VideoCapture(1) # Camera Index
 if not cap.isOpened():
     print("Error: Could not open the camera.")
     exit()
@@ -123,6 +128,17 @@ while dpg.is_dearpygui_running():
     var_threshold = dpg.get_value("var_threshold")
     obstruction_percent = dpg.get_value("obstruction_percent")
     stabilization_threshold = dpg.get_value("stabilization_frames")
+
+    # Get camera control values from GUI
+    cam_brightness = dpg.get_value("cam_brightness")
+    cam_contrast = dpg.get_value("cam_contrast")
+    cam_saturation = dpg.get_value("cam_saturation")
+
+    # Set camera properties
+    cap.set(cv2.CAP_PROP_BRIGHTNESS, cam_brightness)
+    cap.set(cv2.CAP_PROP_CONTRAST, cam_contrast)
+    cap.set(cv2.CAP_PROP_SATURATION, cam_saturation)
+    print("Brightness:", cap.get(cv2.CAP_PROP_BRIGHTNESS))
 
     # Update background subtractor if history or varThreshold changed
     if (bg_subtractor.getHistory() != history) or (bg_subtractor.getVarThreshold() != var_threshold):

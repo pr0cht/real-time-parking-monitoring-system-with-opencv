@@ -4,6 +4,9 @@ import numpy as np
 import dearpygui.dearpygui as dpg
 import time  
 import datetime
+import easyocr
+from license_plate_detector import LicensePlateDetector
+import json
 
 pygame.mixer.init()
 obstructed_sound = pygame.mixer.Sound("beep_obs.wav") # Sound for obstruction
@@ -34,19 +37,25 @@ with dpg.window(label="Parking Status", width=400, height=500):
     dpg.add_slider_float(label="Brightness", tag="cam_brightness", default_value=0.5, min_value=0.0, max_value=1.0)
     dpg.add_slider_float(label="Contrast", tag="cam_contrast", default_value=0.5, min_value=0.0, max_value=1.0)
     dpg.add_slider_float(label="Saturation", tag="cam_saturation", default_value=0.5, min_value=0.0, max_value=1.0)
+    dpg.add_separator()
+    dpg.add_text("Vehicle Entry/Exit Log:", tag="vehicle_log_label")
+    dpg.add_text("", tag="vehicle_log")
 dpg.create_viewport(title="Parking Scanner UI", width=600, height=300)
 dpg.setup_dearpygui()
 dpg.show_viewport()
 
-cap = cv2.VideoCapture(1) # Camera Index
-if not cap.isOpened():
+cap = cv2.VideoCapture(0) # Camera Index for Parking Spaces
+entry_cap = cv2.VideoCapture(1)  # Entry camera
+exit_cap = cv2.VideoCapture(2)   # Exit camera
+
+if not cap.isOpened() or not entry_cap.isOpened() or not exit_cap.isOpened():
     print("Error: Could not open the camera.")
     exit()
-cap.set(cv2.CAP_PROP_FPS, 60)
-cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+# cap.set(cv2.CAP_PROP_FPS, 60)
+# cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
 cap.set(cv2.CAP_PROP_EXPOSURE, -6)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1680)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
 parking1_start = (50, 100) # Define parking1 dimensions first
 parking1_end = (250, 400)  # 
@@ -101,6 +110,12 @@ bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=1000, varThreshold=30
 
 log_messages = []
 
+# Initialize license plate detector
+plate_detector = LicensePlateDetector()
+
+# Dictionary to track vehicles
+vehicles = {}
+
 while dpg.is_dearpygui_running():
     ret, frame = cap.read()
     if not ret:
@@ -138,7 +153,6 @@ while dpg.is_dearpygui_running():
     cap.set(cv2.CAP_PROP_BRIGHTNESS, cam_brightness)
     cap.set(cv2.CAP_PROP_CONTRAST, cam_contrast)
     cap.set(cv2.CAP_PROP_SATURATION, cam_saturation)
-    print("Brightness:", cap.get(cv2.CAP_PROP_BRIGHTNESS))
 
     # Update background subtractor if history or varThreshold changed
     if (bg_subtractor.getHistory() != history) or (bg_subtractor.getVarThreshold() != var_threshold):
@@ -160,9 +174,6 @@ while dpg.is_dearpygui_running():
 
         # Use background subtraction for obstruction detection
         fg_mask = bg_subtractor.apply(parking)
-
-        # Display the foreground mask for testing
-        cv2.imshow(f"Foreground Mask - Parking {i:02}", fg_mask)
 
         _, thresh = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
         white_pixels = cv2.countNonZero(thresh)
@@ -242,11 +253,51 @@ while dpg.is_dearpygui_running():
 
     cv2.imshow("Parking Scanner", frame)
 
+    # Process entry camera
+    ret_entry, entry_frame = entry_cap.read()
+    if ret_entry:
+        entry_frame, plate_text = plate_detector.process_frame(entry_frame)
+        if plate_text and plate_text not in vehicles:
+            vehicles[plate_text] = {
+                "entry_time": datetime.now(),
+                "exit_time": None
+            }
+            log_entry = f"Vehicle {plate_text} entered at {vehicles[plate_text]['entry_time'].strftime('%H:%M:%S')}"
+            log_messages.append(log_entry)
+            
+        cv2.imshow("Entry Camera", entry_frame)
+
+    # Process exit camera
+    ret_exit, exit_frame = exit_cap.read()
+    if ret_exit:
+        exit_frame, plate_text = plate_detector.process_frame(exit_frame)
+        if plate_text and plate_text in vehicles and vehicles[plate_text]["exit_time"] is None:
+            vehicles[plate_text]["exit_time"] = datetime.now()
+            duration = vehicles[plate_text]["exit_time"] - vehicles[plate_text]["entry_time"]
+            log_entry = f"Vehicle {plate_text} exited at {vehicles[plate_text]['exit_time'].strftime('%H:%M:%S')} (Duration: {duration})"
+            log_messages.append(log_entry)
+            
+        cv2.imshow("Exit Camera", exit_frame)
+
+    # Update vehicle log display
+    if log_messages:
+        dpg.set_value("vehicle_log", "\n".join(log_messages[-10:]))  # Show last 10 logs
+
+    # Save vehicle data to JSON file
+    with open("vehicle_log.json", "w") as f:
+        json_data = {k: {
+            "entry_time": v["entry_time"].strftime("%Y-%m-%d %H:%M:%S") if v["entry_time"] else None,
+            "exit_time": v["exit_time"].strftime("%Y-%m-%d %H:%M:%S") if v["exit_time"] else None
+        } for k, v in vehicles.items()}
+        json.dump(json_data, f, indent=4)
+
     if key == ord('q'):
         break
 
     dpg.render_dearpygui_frame()
 
 cap.release()
+entry_cap.release()
+exit_cap.release()
 cv2.destroyAllWindows()
 dpg.destroy_context()

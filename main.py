@@ -44,44 +44,61 @@ dpg.create_viewport(title="Parking Scanner UI", width=600, height=300)
 dpg.setup_dearpygui()
 dpg.show_viewport()
 
-cap = cv2.VideoCapture(0) # Camera Index for Parking Spaces
-entry_cap = cv2.VideoCapture(1)  # Entry camera
-exit_cap = cv2.VideoCapture(2)   # Exit camera
-
-if not cap.isOpened() or not entry_cap.isOpened() or not exit_cap.isOpened():
+# Initialize single camera
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
     print("Error: Could not open the camera.")
     exit()
-# cap.set(cv2.CAP_PROP_FPS, 60)
-# cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-cap.set(cv2.CAP_PROP_EXPOSURE, -6)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-parking1_start = (50, 100) # Define parking1 dimensions first
-parking1_end = (250, 400)  # 
+# Set camera properties
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-parking_width = parking1_end[0] - parking1_start[0]
-parking_height = parking1_end[1] - parking1_start[1]
+# Get initial frame to check dimensions
+ret, test_frame = cap.read()
+if ret:
+    height, width = test_frame.shape[:2]
+    print(f"Camera frame dimensions: {width}x{height}")
+else:
+    print("Error: Could not read initial frame")
+    exit()
 
-parking2_start = (parking1_end[0] + 20, parking1_start[1])
-parking2_end = (parking2_start[0] + parking_width, parking2_start[1] + parking_height)
+# Replace the existing parking area definitions with this
+def calculate_parking_areas(frame_width, frame_height):
+    # Calculate dimensions that fit within the frame
+    parking_width = int(frame_width * 0.15)  # 15% of frame width
+    parking_height = int(frame_height * 0.3)  # 30% of frame height
+    
+    # Start position for first parking space
+    start_x = int(frame_width * 0.05)  # 5% margin from left
+    start_y = int(frame_height * 0.2)  # 20% from top
+    
+    # Space between parking areas
+    space_between = int(parking_width * 0.1)  # 10% of parking width
+    
+    parking_areas = []
+    for i in range(5):
+        start = (start_x + (parking_width + space_between) * i, start_y)
+        end = (start[0] + parking_width, start[1] + parking_height)
+        status_tag = f"parking{i+1}_status"
+        parking_areas.append((start, end, status_tag))
+    
+    return parking_areas
 
-parking3_start = (parking2_end[0] + 20, parking2_start[1])
-parking3_end = (parking3_start[0] + parking_width, parking3_start[1] + parking_height)
+# Initialize frame dimensions and parking areas
+ret, init_frame = cap.read()
+if not ret:
+    print("Error: Could not read initial frame from camera")
+    exit()
 
-parking4_start = (parking3_end[0] + 20, parking3_start[1])
-parking4_end = (parking4_start[0] + parking_width, parking4_start[1] + parking_height)
+frame_height, frame_width = init_frame.shape[:2]
+print(f"Camera frame dimensions: {frame_width}x{frame_height}")
 
-parking5_start = (parking4_end[0] + 20, parking4_start[1])
-parking5_end = (parking5_start[0] + parking_width, parking5_start[1] + parking_height)
+# Calculate parking areas based on frame size
+parking_areas = calculate_parking_areas(frame_width, frame_height)
 
-parking_areas = [
-    (parking1_start, parking1_end, "parking1_status"),
-    (parking2_start, parking2_end, "parking2_status"),
-    (parking3_start, parking3_end, "parking3_status"),
-    (parking4_start, parking4_end, "parking4_status"),
-    (parking5_start, parking5_end, "parking5_status"),
-]
+# Remove the old parking area definitions
+# (Delete all the parking1_start through parking5_end variables)
 
 # Initialize dictionaries
 previous_status = {status_tag: "Vacant" for _, _, status_tag in parking_areas}
@@ -122,15 +139,20 @@ while dpg.is_dearpygui_running():
         print("Error: Could not read from the camera.")
         break
 
+    # Create copies for different views
+    parking_frame = frame.copy()
+    entry_frame = frame.copy()
+    exit_frame = frame.copy()
+
     key = cv2.waitKey(1) & 0xFF
 
     if key == ord('s'):  # Set or update the reference frame
-        ref_frame = frame.copy()
+        ref_frame = parking_frame.copy()
         print("Reference frame updated.")
         continue
 
     if ref_frame is None:     # Skip processing if reference frame is not set
-        cv2.imshow("Parking Scanner", frame)
+        cv2.imshow("Parking Scanner", parking_frame)
         if key == ord('q'):
             break
         dpg.render_dearpygui_frame()
@@ -160,123 +182,139 @@ while dpg.is_dearpygui_running():
             history=history, varThreshold=var_threshold, detectShadows=False
         )
 
-    for i, (start, end, status_tag) in enumerate(parking_areas, start=1):     # Process each parking area
-        parking = frame[start[1]:end[1], start[0]:end[0]]
+    # Modify the parking area processing loop
+    for i, (start, end, status_tag) in enumerate(parking_areas, start=1):
+        # Add bounds checking
+        start_x = max(0, min(start[0], frame.shape[1]-1))
+        start_y = max(0, min(start[1], frame.shape[0]-1))
+        end_x = max(0, min(end[0], frame.shape[1]-1))
+        end_y = max(0, min(end[1], frame.shape[0]-1))
+        
+        # Skip if invalid dimensions
+        if start_x >= end_x or start_y >= end_y:
+            print(f"Warning: Invalid dimensions for parking area {i}")
+            continue
+        
+        try:
+            parking = frame[start_y:end_y, start_x:end_x]
+            if parking.size == 0:
+                print(f"Warning: Empty parking area {i}")
+                continue
+                
+            gray_parking = cv2.cvtColor(parking, cv2.COLOR_BGR2GRAY)
+            cars = car_cascade.detectMultiScale(
+                gray_parking,
+                scaleFactor=scale_factor,
+                minNeighbors=min_neighbors,
+                minSize=(30, 30)
+            )
 
-        # Use adjustable parameters in detection
-        gray_parking = cv2.cvtColor(parking, cv2.COLOR_BGR2GRAY)
-        cars = car_cascade.detectMultiScale(
-            gray_parking,
-            scaleFactor=scale_factor,
-            minNeighbors=min_neighbors,
-            minSize=(30, 30)
-        )
+            # Use background subtraction for obstruction detection
+            fg_mask = bg_subtractor.apply(parking)
 
-        # Use background subtraction for obstruction detection
-        fg_mask = bg_subtractor.apply(parking)
+            _, thresh = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+            white_pixels = cv2.countNonZero(thresh)
 
-        _, thresh = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-        white_pixels = cv2.countNonZero(thresh)
+            total_pixels = thresh.shape[0] * thresh.shape[1]
+            percent_change = (white_pixels / total_pixels) * 100
 
-        total_pixels = thresh.shape[0] * thresh.shape[1]
-        percent_change = (white_pixels / total_pixels) * 100
+            # Use adjustable obstruction threshold
+            current_status = "Vacant"
+            color = (0, 255, 0)
+            if len(cars) > 0:
+                current_status = "Occupied"
+                color = (0, 0, 255)
+            elif percent_change > obstruction_percent:
+                current_status = "Obstructed"
+                color = (0, 165, 255)
 
-        # Use adjustable obstruction threshold
-        current_status = "Vacant"
-        color = (0, 255, 0)
-        if len(cars) > 0:
-            current_status = "Occupied"
-            color = (0, 0, 255)
-        elif percent_change > obstruction_percent:
-            current_status = "Obstructed"
-            color = (0, 165, 255)
+            # Update stabilization counters
+            for status in stabilization_counters[status_tag]:
+                if status == current_status:
+                    stabilization_counters[status_tag][status] += 1
+                else:
+                    stabilization_counters[status_tag][status] = max(0, stabilization_counters[status_tag][status] - 1)
 
-        # Update stabilization counters
-        for status in stabilization_counters[status_tag]:
-            if status == current_status:
-                stabilization_counters[status_tag][status] += 1
-            else:
-                stabilization_counters[status_tag][status] = max(0, stabilization_counters[status_tag][status] - 1)
+            # Confirm the status change only if it persists for the stabilization threshold
+            if stabilization_counters[status_tag][current_status] >= stabilization_threshold:
+                if previous_status[status_tag] != current_status:
+                    # Log parking duration when switching from "Occupied" to "Vacant"
+                    if previous_status[status_tag] == "Occupied" and current_status == "Vacant":
+                        parking_end_time[status_tag] = time.time()
+                        duration = parking_end_time[status_tag] - parking_start_time[status_tag]
+                        if duration >= 10:  # Only log if occupied for 10 seconds or more for guaranteed parking 
+                            # Convert duration to h:m:s
+                            hours = int(duration // 3600)
+                            minutes = int((duration % 3600) // 60)
+                            seconds = int(duration % 60)
+                            log_entry = f"Parking {i:02} was occupied for {hours:02}:{minutes:02}:{seconds:02}."
+                            print(log_entry)
+                            log_messages.append(log_entry)
+                            # Keep only the last 10 log entries
+                            if len(log_messages) > 10:
+                                log_messages.pop(0)
+                            dpg.set_value("parking_log", "\n".join(log_messages))
+                            date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+                            with open(f"parking_log_{date_str}.txt", "a") as logfile:
+                                logfile.write(log_entry + "\n")
+                        else:
+                            pass
 
-        # Confirm the status change only if it persists for the stabilization threshold
-        if stabilization_counters[status_tag][current_status] >= stabilization_threshold:
-            if previous_status[status_tag] != current_status:
-                # Log parking duration when switching from "Occupied" to "Vacant"
-                if previous_status[status_tag] == "Occupied" and current_status == "Vacant":
-                    parking_end_time[status_tag] = time.time()
-                    duration = parking_end_time[status_tag] - parking_start_time[status_tag]
-                    if duration >= 10:  # Only log if occupied for 10 seconds or more for guaranteed parking 
-                        # Convert duration to h:m:s
-                        hours = int(duration // 3600)
-                        minutes = int((duration % 3600) // 60)
-                        seconds = int(duration % 60)
-                        log_entry = f"Parking {i:02} was occupied for {hours:02}:{minutes:02}:{seconds:02}."
-                        print(log_entry)
-                        log_messages.append(log_entry)
-                        # Keep only the last 10 log entries
-                        if len(log_messages) > 10:
-                            log_messages.pop(0)
-                        dpg.set_value("parking_log", "\n".join(log_messages))
-                        date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-                        with open(f"parking_log_{date_str}.txt", "a") as logfile:
-                            logfile.write(log_entry + "\n")
-                    else:
-                        pass
+                    # Start tracking time when switching to "Occupied"
+                    if current_status == "Occupied":
+                        parking_start_time[status_tag] = time.time()
 
-                # Start tracking time when switching to "Occupied"
-                if current_status == "Occupied":
-                    parking_start_time[status_tag] = time.time()
+                    previous_status[status_tag] = current_status
 
-                previous_status[status_tag] = current_status
+                    # Play sound only when the status changes
+                    pygame.mixer.stop()
+                    if current_status == "Occupied":
+                        pass  
+                    elif current_status == "Obstructed":
+                        obstructed_sound.play()
+                    elif current_status == "Vacant":
+                        vacant_sound.play()
 
-                # Play sound only when the status changes
-                pygame.mixer.stop()
-                if current_status == "Occupied":
-                    pass  
-                elif current_status == "Obstructed":
-                    obstructed_sound.play()
-                elif current_status == "Vacant":
-                    vacant_sound.play()
+            display_text = f"Parking {i:02}: {previous_status[status_tag]}"
+            if previous_status[status_tag] == "Occupied" and parking_start_time[status_tag] is not None:
+                elapsed = int(time.time() - parking_start_time[status_tag])
+                hours = elapsed // 3600
+                minutes = (elapsed % 3600) // 60
+                seconds = elapsed % 60
+                display_text += f" [{hours:02}:{minutes:02}:{seconds:02}]"
+            dpg.set_value(status_tag, display_text)
 
-        display_text = f"Parking {i:02}: {previous_status[status_tag]}"
-        if previous_status[status_tag] == "Occupied" and parking_start_time[status_tag] is not None:
-            elapsed = int(time.time() - parking_start_time[status_tag])
-            hours = elapsed // 3600
-            minutes = (elapsed % 3600) // 60
-            seconds = elapsed % 60
-            display_text += f" [{hours:02}:{minutes:02}:{seconds:02}]"
-        dpg.set_value(status_tag, display_text)
-
-        cv2.rectangle(frame, start, end, color, 2)
-        cv2.putText(frame, previous_status[status_tag], (start[0], start[1] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            cv2.rectangle(frame, start, end, color, 2)
+            cv2.putText(frame, previous_status[status_tag], (start[0], start[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        except cv2.error as e:
+            print(f"Error processing parking area {i}: {e}")
+            continue
 
     cv2.imshow("Parking Scanner", frame)
 
-    # Process entry camera
-    ret_entry, entry_frame = entry_cap.read()
-    if ret_entry:
+    # Process entry view (using the same frame)
+    if entry_frame is not None:
         entry_frame, plate_text = plate_detector.process_frame(entry_frame)
         if plate_text and plate_text not in vehicles:
             vehicles[plate_text] = {
-                "entry_time": datetime.now(),
+                "entry_time": datetime.datetime.now(),
                 "exit_time": None
             }
             log_entry = f"Vehicle {plate_text} entered at {vehicles[plate_text]['entry_time'].strftime('%H:%M:%S')}"
             log_messages.append(log_entry)
-            
+        
         cv2.imshow("Entry Camera", entry_frame)
 
-    # Process exit camera
-    ret_exit, exit_frame = exit_cap.read()
-    if ret_exit:
+    # Process exit view (using the same frame)
+    if exit_frame is not None:
         exit_frame, plate_text = plate_detector.process_frame(exit_frame)
         if plate_text and plate_text in vehicles and vehicles[plate_text]["exit_time"] is None:
-            vehicles[plate_text]["exit_time"] = datetime.now()
+            vehicles[plate_text]["exit_time"] = datetime.datetime.now()
             duration = vehicles[plate_text]["exit_time"] - vehicles[plate_text]["entry_time"]
             log_entry = f"Vehicle {plate_text} exited at {vehicles[plate_text]['exit_time'].strftime('%H:%M:%S')} (Duration: {duration})"
             log_messages.append(log_entry)
-            
+        
         cv2.imshow("Exit Camera", exit_frame)
 
     # Update vehicle log display
@@ -297,7 +335,5 @@ while dpg.is_dearpygui_running():
     dpg.render_dearpygui_frame()
 
 cap.release()
-entry_cap.release()
-exit_cap.release()
 cv2.destroyAllWindows()
 dpg.destroy_context()

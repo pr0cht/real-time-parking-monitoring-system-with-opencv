@@ -1,0 +1,9 @@
+# Training data paths (relative to the 'plate_trainer' folder where you run training)
+path: ./datasets  # Specifies the root directory containing images/ and labels/
+train: images/train  # Path to training images folder (relative to 'path')
+val: images/val    # Path to validation images folder (relative to 'path')
+# test: images/test # Uncomment this if you create a test set later
+
+# Class names
+names:
+  0: License Plate # Class ID 0 (from voc_to_yolo.py) corresponds to this name

@@ -1,82 +1,95 @@
+# license_plate_detector.py
 import cv2
-import xml.etree.ElementTree as ET
-import os
-import numpy as np
 import easyocr
+import numpy as np
+import re
 
 class LicensePlateDetector:
-    def __init__(self):
-        self.reader = easyocr.Reader(['en'])
-        self.plates_data = self.load_training_data()
-        
-    def load_training_data(self):
-        plates_data = []
-        annotations_path = "licenseplates/annotations"
-        images_path = "licenseplates/images"
-        
-        for xml_file in os.listdir(annotations_path):
-            if xml_file.endswith('.xml'):
-                tree = ET.parse(os.path.join(annotations_path, xml_file))
-                root = tree.getroot()
-                
-                # Get image path
-                image_file = root.find('filename').text
-                image_path = os.path.join(images_path, image_file)
-                
-                # Get bounding box
-                for obj in root.findall('.//object'):
-                    if obj.find('name').text == 'licence':
-                        bbox = obj.find('bndbox')
-                        xmin = int(bbox.find('xmin').text)
-                        ymin = int(bbox.find('ymin').text)
-                        xmax = int(bbox.find('xmax').text)
-                        ymax = int(bbox.find('ymax').text)
-                        
-                        plates_data.append({
-                            'image': cv2.imread(image_path),
-                            'bbox': (xmin, ymin, xmax, ymax)
-                        })
-        
-        return plates_data
-    
-    def detect_plate(self, frame):
-        best_match = None
-        best_score = float('inf')
-        plate_text = None
-        
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Try to match with training data
-        for plate_data in self.plates_data:
-            template = cv2.cvtColor(plate_data['image'], cv2.COLOR_BGR2GRAY)
-            result = cv2.matchTemplate(gray, template, cv2.TM_SQDIFF_NORMED)
-            _, score, _, _ = cv2.minMaxLoc(result)
+    def __init__(self, cascade_path='haarcascade_russian_plate_number.xml'):
+        self.cascade = cv2.CascadeClassifier(cascade_path)
+        if self.cascade.empty():
+            raise IOError(f"Failed to load Haar Cascade from {cascade_path}. Make sure the file is in the correct directory.")
             
-            if score < best_score:
-                best_score = score
-                best_match = plate_data['bbox']
-        
-        if best_score < 0.8:  # Threshold for matching
-            x1, y1, x2, y2 = best_match
-            plate_roi = frame[y1:y2, x1:x2]
-            
-            # Use EasyOCR to read the plate
-            results = self.reader.readtext(plate_roi)
-            if results:
-                plate_text = results[0][1]  # Get the text from first result
-                
-            return True, (x1, y1, x2, y2), plate_text
-            
-        return False, None, None
+        self.reader = easyocr.Reader(['en'], gpu=False) # Set gpu=True if you have a compatible NVIDIA GPU
 
-    def process_frame(self, frame):
-        detected, bbox, plate_text = self.detect_plate(frame)
+        # --- NEW: Regex to keep only uppercase letters and numbers ---
+        self.char_filter = re.compile("[^A-Z0-9]")
+
+    def __preprocess_roi(self, roi):
+        """
+        Applies image processing to the cropped plate to improve OCR accuracy.
+        A low-quality camera feed needs this boost.
+        """
+        # Convert to grayscale
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
-        if detected:
-            x1, y1, x2, y2 = bbox
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            if plate_text:
-                cv2.putText(frame, plate_text, (x1, y1-10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        # Apply adaptive thresholding to create a clean, high-contrast binary image
+        # This is excellent for handling shadows and uneven lighting.
+        thresh = cv2.adaptiveThreshold(gray, 255, 
+                                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                       cv2.THRESH_BINARY_INV, # Use INV to get black text on white background
+                                       11, # Size of the pixel neighborhood
+                                       2)  # Constant subtracted from the mean
+        
+        # You could also add blurring here if the image is very noisy
+        # e.g., median = cv2.medianBlur(thresh, 3)
+        # return median
+        
+        return thresh
+
+    def __clean_text(self, text):
+        """
+        Cleans the raw OCR output to a standardized format.
+        """
+        if not text:
+            return None
+            
+        # Remove all non-alphanumeric characters
+        cleaned_text = self.char_filter.sub('', text)
+        
+        # --- NEW: Add a length filter ---
+        # This filters out random noise like 'I' or 'T' that OCR might see.
+        # Adjust 4 and 8 based on Philippine plate formats (e.g., LLL NNN, LL NNNN)
+        if 4 <= len(cleaned_text) <= 8:
+            return cleaned_text
+        
+        return None
+
+def detect_and_read(self, frame):
+        plate_text = None
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # --- MODIFIED: Increased minNeighbors to reduce false positives ---
+        # Try 10. If it still finds text, try 15.
+        # If it stops finding the real plate, you may need a value in between.
+        plates = self.cascade.detectMultiScale(gray_frame, 
+                                               scaleFactor=1.1, 
+                                               minNeighbors=10, # Was 4
+                                               minSize=(40, 40))
+        
+        if len(plates) > 0:
+            x, y, w, h = plates[0]
+            
+            x1 = max(0, x - 5)
+            y1 = max(0, y - 5)
+            x2 = min(frame.shape[1], x + w + 5)
+            y2 = min(frame.shape[0], y + h + 5)
+            
+            plate_roi = frame[y1:y2, x1:x2]
+
+            if plate_roi.size > 0:
+                processed_roi = self.__preprocess_roi(plate_roi)
                 
+                ocr_result = self.reader.readtext(processed_roi, 
+                                                  detail=0, 
+                                                  allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
+                
+                if ocr_result:
+                    raw_text = "".join(ocr_result).strip().upper()
+                    plate_text = self.__clean_text(raw_text)
+
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 255, 0), 2)
+            label = plate_text if plate_text else "Detecting..."
+            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            
         return frame, plate_text

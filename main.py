@@ -1,339 +1,632 @@
+# main.py
 import cv2
-import pygame
-import numpy as np 
 import dearpygui.dearpygui as dpg
-import time  
+import time
 import datetime
+from threading import Thread, Event
+from queue import Queue
+from ultralytics import YOLO
 import easyocr
-from license_plate_detector import LicensePlateDetector
-import json
+import re
+import torch
+import os
+import atexit # For saving logs on exit
 
-pygame.mixer.init()
-obstructed_sound = pygame.mixer.Sound("beep_obs.wav") # Sound for obstruction
-vacant_sound = pygame.mixer.Sound("beep_vac.wav")   # Sound for vacancy when a car leaves
+# --- Pygame for Sound ---
+import pygame
+try:
+    pygame.mixer.init()
+    entry_sound = pygame.mixer.Sound("entry_beep.wav")
+    exit_sound = pygame.mixer.Sound("exit_beep.wav")
+    sound_enabled = True
+except Exception as e:
+    print(f"[Warning] Failed to initialize sound or load WAV files: {e}. Sound disabled.")
+    sound_enabled = False
 
-car_cascade = cv2.CascadeClassifier("cars.xml") # Load Haar Cascade for car detection
+# --- Global Configuration & State ---
+stop_event = Event()
+MIN_SCAN_DURATION = 2.0  # seconds
+RESET_COOLDOWN = 1.0
+FRAME_SKIP_INTERVAL = 5
 
-dpg.create_context() # Initialize UI window
-with dpg.window(label="Parking Status", width=400, height=500):
-    dpg.add_text("Parking 01: Vacant", tag="parking1_status")
-    dpg.add_text("Parking 02: Vacant", tag="parking2_status")
-    dpg.add_text("Parking 03: Vacant", tag="parking3_status")
-    dpg.add_text("Parking 04: Vacant", tag="parking4_status")
-    dpg.add_text("Parking 05: Vacant", tag="parking5_status")
-    dpg.add_separator()
-    dpg.add_text("Parking Log:", tag="log_label")
-    dpg.add_text("", tag="parking_log")
-    dpg.add_separator()
-    dpg.add_text("Detection Parameters")
-    dpg.add_slider_float(label="Scale Factor", tag="scale_factor", default_value=1.010, min_value=1.01, max_value=1.5, format="%.3f")
-    dpg.add_slider_int(label="Min Neighbors", tag="min_neighbors", default_value=3, min_value=1, max_value=10)
-    dpg.add_slider_int(label="History", tag="history", default_value=1000, min_value=100, max_value=2000)
-    dpg.add_slider_int(label="VarThreshold", tag="var_threshold", default_value=300, min_value=10, max_value=1000)
-    dpg.add_slider_int(label="Obstruction %", tag="obstruction_percent", default_value=30, min_value=5, max_value=90)
-    dpg.add_slider_int(label="Stabilization Frames", tag="stabilization_frames", default_value=15, min_value=1, max_value=60)
-    dpg.add_separator()
-    dpg.add_text("Camera Controls")
-    dpg.add_slider_float(label="Brightness", tag="cam_brightness", default_value=0.5, min_value=0.0, max_value=1.0)
-    dpg.add_slider_float(label="Contrast", tag="cam_contrast", default_value=0.5, min_value=0.0, max_value=1.0)
-    dpg.add_slider_float(label="Saturation", tag="cam_saturation", default_value=0.5, min_value=0.0, max_value=1.0)
-    dpg.add_separator()
-    dpg.add_text("Vehicle Entry/Exit Log:", tag="vehicle_log_label")
-    dpg.add_text("", tag="vehicle_log")
-dpg.create_viewport(title="Parking Scanner UI", width=600, height=300)
-dpg.setup_dearpygui()
-dpg.show_viewport()
+# --- YOLO and OCR Initialization ---
+try:
+    yolo_model = YOLO('best.pt') # Your custom license plate model
+    device_to_use = 0 if torch.cuda.is_available() else 'cpu' # Force GPU if available
+    print(f"Using device: {device_to_use}")
+except Exception as e:
+    print(f"Error initializing YOLO: {e}. Ensure 'best.pt' is present.")
+    exit() # Exit if model can't load
 
-# Initialize single camera
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("Error: Could not open the camera.")
-    exit()
+try:
+     ocr_reader = easyocr.Reader(['en'], gpu=(device_to_use == 0)) # Use GPU if available
+except Exception as e:
+     print(f"Error initializing EasyOCR on GPU: {e}. Falling back to CPU.")
+     ocr_reader = easyocr.Reader(['en'], gpu=False)
 
-# Set camera properties
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+# --- Plate Scanning State ---
+scan_state = {
+    "entry": {"plate": None, "first_seen": 0, "last_seen": 0, "logged": False, "frame_count": 0, "last_detected_plate": None},
+    "exit": {"plate": None, "first_seen": 0, "last_seen": 0, "logged": False, "frame_count": 0, "last_detected_plate": None}
+}
 
-# Get initial frame to check dimensions
-ret, test_frame = cap.read()
-if ret:
-    height, width = test_frame.shape[:2]
-    print(f"Camera frame dimensions: {width}x{height}")
-else:
-    print("Error: Could not read initial frame")
-    exit()
+# --- Logging Data Structures ---
+entry_log_messages = []
+exit_log_messages = []
+duration_log_messages = []
+vehicles_inside = {} # Store plate -> entry_datetime
 
-# Replace the existing parking area definitions with this
-def calculate_parking_areas(frame_width, frame_height):
-    # Calculate dimensions that fit within the frame
-    parking_width = int(frame_width * 0.15)  # 15% of frame width
-    parking_height = int(frame_height * 0.3)  # 30% of frame height
-    
-    # Start position for first parking space
-    start_x = int(frame_width * 0.05)  # 5% margin from left
-    start_y = int(frame_height * 0.2)  # 20% from top
-    
-    # Space between parking areas
-    space_between = int(parking_width * 0.1)  # 10% of parking width
-    
-    parking_areas = []
-    for i in range(5):
-        start = (start_x + (parking_width + space_between) * i, start_y)
-        end = (start[0] + parking_width, start[1] + parking_height)
-        status_tag = f"parking{i+1}_status"
-        parking_areas.append((start, end, status_tag))
-    
-    return parking_areas
-
-# Initialize frame dimensions and parking areas
-ret, init_frame = cap.read()
-if not ret:
-    print("Error: Could not read initial frame from camera")
-    exit()
-
-frame_height, frame_width = init_frame.shape[:2]
-print(f"Camera frame dimensions: {frame_width}x{frame_height}")
-
-# Calculate parking areas based on frame size
-parking_areas = calculate_parking_areas(frame_width, frame_height)
-
-# Remove the old parking area definitions
-# (Delete all the parking1_start through parking5_end variables)
-
-# Initialize dictionaries
-previous_status = {status_tag: "Vacant" for _, _, status_tag in parking_areas}
-detection_counters = {status_tag: 0 for _, _, status_tag in parking_areas}
-status_history = {status_tag: [] for _, _, status_tag in parking_areas}
-history_length = 15  # Length of history to keep for each parking area
-
-detection_threshold = 10  # Threshold for detecting a car in the parking area
-
-# Initialize stabilization counters for each parking area
-stabilization_counters = {status_tag: {"Occupied": 0, "Obstructed": 0, "Vacant": 0} for _, _, status_tag in parking_areas}
-stabilization_threshold = 15  # Number of consecutive frames required to confirm a status change
-
-print("Press 's' anytime to set/update the reference frame. Press 'q' to quit.")
-
-# Reference frame for detecting changes
+# --- Parking State ---
+bg_subtractor = None
 ref_frame = None
+parking_areas = [] # List of tuples: (start_coords, end_coords, status_tag, occupied_flag)
+latest_parking_frame = None
+# --- NEW: Car Cascade for Parking ---
+try:
+    car_cascade = cv2.CascadeClassifier('cars.xml')
+    if car_cascade.empty():
+        raise IOError("Could not load cars.xml")
+    print("Car cascade loaded successfully for parking validation.")
+except Exception as e:
+    print(f"[ERROR] Failed to load 'cars.xml': {e}. Car validation in parking will be disabled.")
+    car_cascade = None
 
-# Initialize dictionaries for parking duration tracking
-parking_start_time = {status_tag: None for _, _, status_tag in parking_areas}
-parking_end_time = {status_tag: None for _, _, status_tag in parking_areas}
-delay_counters = {status_tag: 0 for _, _, status_tag in parking_areas}  # Delay mechanism   
+# --- Utility Functions ---
+def format_duration(seconds):
+    """Formats seconds into H hours M minutes S seconds"""
+    if seconds < 0: return "Negative duration?"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
 
-# Initialize background subtractor
-bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=1000, varThreshold=300, detectShadows=False)
+# --- Function to save logs on exit ---
+log_file_name = f"parking_session_log_{datetime.datetime.now():%Y-%m-%d_%H-%M-%S}.txt"
+def save_logs():
+    print(f"\nSaving logs to {log_file_name}...")
+    try:
+        with open(log_file_name, 'w') as f:
+            f.write("--- Session Log ---\n")
+            f.write(f"End Time: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n\n")
 
-log_messages = []
+            f.write("--- Entry Logs ---\n")
+            if entry_log_messages:
+                f.write("\n".join(entry_log_messages) + "\n")
+            else:
+                f.write("No entries recorded.\n")
+            f.write("\n")
 
-# Initialize license plate detector
-plate_detector = LicensePlateDetector()
+            f.write("--- Exit Logs ---\n")
+            if exit_log_messages:
+                f.write("\n".join(exit_log_messages) + "\n")
+            else:
+                f.write("No exits recorded.\n")
+            f.write("\n")
 
-# Dictionary to track vehicles
-vehicles = {}
+            f.write("--- Duration Logs (Completed Stays) ---\n")
+            if duration_log_messages:
+                f.write("\n".join(duration_log_messages) + "\n")
+            else:
+                f.write("No completed stays recorded.\n")
+            f.write("\n")
 
-while dpg.is_dearpygui_running():
-    ret, frame = cap.read()
-    if not ret:
-        print("Error: Could not read from the camera.")
-        break
+            # Log vehicles still inside at shutdown
+            f.write("--- Vehicles Still Inside at Shutdown ---\n")
+            if vehicles_inside:
+                for plate, entry_time in vehicles_inside.items():
+                    f.write(f"{plate} (Entered: {entry_time:%Y-%m-%d %H:%M:%S})\n")
+            else:
+                f.write("No vehicles inside at shutdown.\n")
 
-    # Create copies for different views
-    parking_frame = frame.copy()
-    entry_frame = frame.copy()
-    exit_frame = frame.copy()
+        print("Logs saved successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to save logs: {e}")
 
-    key = cv2.waitKey(1) & 0xFF
+# Register the save function to run on exit
+atexit.register(save_logs)
 
-    if key == ord('s'):  # Set or update the reference frame
-        ref_frame = parking_frame.copy()
-        print("Reference frame updated.")
-        continue
 
-    if ref_frame is None:     # Skip processing if reference frame is not set
-        cv2.imshow("Parking Scanner", parking_frame)
-        if key == ord('q'):
-            break
-        dpg.render_dearpygui_frame()
-        continue
+# --- Camera Worker (Unchanged) ---
+def camera_worker(camera_source, output_queue, processing_function, camera_name):
+    cap = cv2.VideoCapture(camera_source)
+    if not cap.isOpened():
+        print(f"[ERROR] Cannot open camera {camera_source}")
+        return
 
-    # Get current parameter values from GUI
-    scale_factor = dpg.get_value("scale_factor")
-    min_neighbors = dpg.get_value("min_neighbors")
-    history = dpg.get_value("history")
-    var_threshold = dpg.get_value("var_threshold")
-    obstruction_percent = dpg.get_value("obstruction_percent")
-    stabilization_threshold = dpg.get_value("stabilization_frames")
+    print(f"[{camera_name}] Thread started.")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640) # Set a consistent resolution
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    # Get camera control values from GUI
-    cam_brightness = dpg.get_value("cam_brightness")
-    cam_contrast = dpg.get_value("cam_contrast")
-    cam_saturation = dpg.get_value("cam_saturation")
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            print(f"[{camera_name}] Warning: Failed to grab frame.")
+            time.sleep(0.5) # Wait longer if failing
+            # Attempt to reconnect (optional, can be complex)
+            # cap.release()
+            # cap = cv2.VideoCapture(camera_source)
+            # if not cap.isOpened(): print(f"[{camera_name}] Reconnect failed."); break
+            continue
 
-    # Set camera properties
-    cap.set(cv2.CAP_PROP_BRIGHTNESS, cam_brightness)
-    cap.set(cv2.CAP_PROP_CONTRAST, cam_contrast)
-    cap.set(cv2.CAP_PROP_SATURATION, cam_saturation)
+        if camera_name == "parking":
+            global latest_parking_frame
+            latest_parking_frame = frame.copy()
 
-    # Update background subtractor if history or varThreshold changed
-    if (bg_subtractor.getHistory() != history) or (bg_subtractor.getVarThreshold() != var_threshold):
-        bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=history, varThreshold=var_threshold, detectShadows=False
+        processed_frame, data = processing_function(frame, camera_name)
+
+        if not output_queue.full():
+            output_queue.put((camera_name, processed_frame, data))
+        else:
+            time.sleep(0.005) # Prevent busy-waiting if queue is full
+
+    cap.release()
+    print(f"[{camera_name}] Thread stopped.")
+
+
+# --- License Plate Processing Function (Added Sound) ---
+YOLO_CONF_THRESHOLD = 0.40 # Confidence threshold
+
+def process_license_plate_frame(frame, camera_name):
+    now = time.time()
+    state = scan_state[camera_name]
+    state["frame_count"] += 1
+    plate_text = None
+    processed_frame = frame.copy()
+    plate_bbox = None
+
+    if state["frame_count"] % FRAME_SKIP_INTERVAL == 0:
+        results = yolo_model.predict(
+            processed_frame, imgsz=320, verbose=False, device=device_to_use,
+            classes=[0], conf=YOLO_CONF_THRESHOLD
         )
+        best_conf = 0
+        plate_roi = None
+        for result in results:
+            boxes = result.boxes
+            if boxes:
+                for box in boxes:
+                    conf = box.conf[0].item()
+                    if conf >= YOLO_CONF_THRESHOLD and conf > best_conf:
+                         best_conf = conf
+                         xyxy = box.xyxy[0].int().tolist()
+                         plate_bbox = xyxy
+                         x1, y1, x2, y2 = xyxy
+                         if x1 < x2 and y1 < y2 and x1 >=0 and y1 >=0 and x2 <= processed_frame.shape[1] and y2 <= processed_frame.shape[0]:
+                             plate_roi = processed_frame[y1:y2, x1:x2]
+                         else:
+                             plate_roi = None; plate_bbox = None
 
-    # Modify the parking area processing loop
-    for i, (start, end, status_tag) in enumerate(parking_areas, start=1):
-        # Add bounds checking
-        start_x = max(0, min(start[0], frame.shape[1]-1))
-        start_y = max(0, min(start[1], frame.shape[0]-1))
-        end_x = max(0, min(end[0], frame.shape[1]-1))
-        end_y = max(0, min(end[1], frame.shape[0]-1))
-        
-        # Skip if invalid dimensions
-        if start_x >= end_x or start_y >= end_y:
-            print(f"Warning: Invalid dimensions for parking area {i}")
-            continue
-        
+        if plate_roi is not None and plate_roi.size > 0:
+            gray_roi = cv2.cvtColor(plate_roi, cv2.COLOR_BGR2GRAY)
+            thresh_roi = cv2.adaptiveThreshold(gray_roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 5)
+            ocr_results = ocr_reader.readtext(thresh_roi, detail=0, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
+
+            if ocr_results:
+                raw_text = "".join(ocr_results).strip().upper().replace(" ", "")
+                raw_text = re.sub(r'[^A-Z0-9]', '', raw_text) # Keep only A-Z, 0-9
+                raw_text = raw_text.replace('O', '0').replace('I', '1').replace('S', '5').replace('B', '8').replace('Z', '2')
+                if 5 <= len(raw_text) <= 7:
+                    plate_text = raw_text
+                    state["last_detected_plate"] = plate_text
+                else: # Log failure only once per detection change for clarity
+                    if state.get("last_raw_text") != raw_text:
+                        print(f"[{camera_name}] OCR text '{raw_text}' (len {len(raw_text)}) failed length filter (5-8). Raw: {ocr_results}")
+                        state["last_raw_text"] = raw_text
+
+            if plate_bbox: # Only draw if YOLO detected something this frame
+                cv2.rectangle(processed_frame, (plate_bbox[0], plate_bbox[1]), (plate_bbox[2], plate_bbox[3]), (0, 255, 0), 2)
+                label = plate_text if plate_text else ("Reading..." if plate_bbox else "No Plate")
+                cv2.putText(processed_frame, label, (plate_bbox[0], plate_bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        else:
+             state["last_detected_plate"] = None
+             plate_text = None
+    else:
+        plate_text = state.get("last_detected_plate", None)
+
+    current_plate_in_state = state["plate"]
+    if plate_text:
+        state["last_seen"] = now
+        if plate_text == current_plate_in_state:
+            scan_duration = now - state["first_seen"]
+            if scan_duration >= MIN_SCAN_DURATION and not state["logged"]:
+                event_type = "ENTRY" if camera_name == "entry" else "EXIT"
+                log_this_event = False
+                current_time = datetime.datetime.now()
+
+                if event_type == "ENTRY":
+                    if plate_text not in vehicles_inside:
+                        vehicles_inside[plate_text] = current_time # Store entry time
+                        log_this_event = True
+                        print(f"Vehicle {plate_text} entered. Currently inside: {list(vehicles_inside.keys())}")
+                        if sound_enabled: entry_sound.play() # Play entry sound
+                elif event_type == "EXIT":
+                    if plate_text in vehicles_inside:
+                        entry_time = vehicles_inside.pop(plate_text) # Remove and get entry time
+                        duration = current_time - entry_time
+                        formatted_duration = format_duration(duration.total_seconds())
+                        duration_msg = f"{plate_text} - Parked for: {formatted_duration}"
+                        duration_log_messages.append(duration_msg)
+                        log_this_event = True
+                        print(f"Vehicle {plate_text} exited. Duration: {formatted_duration}. Currently inside: {list(vehicles_inside.keys())}")
+                        if sound_enabled: exit_sound.play() # Play exit sound
+
+                state["logged"] = True
+                if log_this_event:
+                    timestamp_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
+                    log_entry = f"{timestamp_str} - {plate_text}" # Simplified log format
+                    state["last_detected_plate"] = None
+                    # Return event type along with log entry for GUI sorting
+                    return processed_frame, {"log": log_entry, "type": event_type}
+        else:
+            state["plate"] = plate_text
+            state["first_seen"] = now
+            state["logged"] = False
+    else:
+        if current_plate_in_state is not None and (now - state["last_seen"]) > RESET_COOLDOWN:
+            state["plate"] = None; state["first_seen"] = 0; state["logged"] = False; state["last_detected_plate"] = None
+
+    return processed_frame, None
+
+# --- Parking Lot Processing Function (Added Car Detection) ---
+def process_parking_frame(frame, camera_name):
+    global ref_frame, bg_subtractor, parking_areas
+    statuses = [] # Store (status_tag, status_text)
+    processed_frame = frame.copy() # Work on a copy
+    dpg_values_ok = False # Flag to check if DPG values were read
+
+    # --- Check 1: Is ref_frame actually set? ---
+    if ref_frame is not None:
+        # --- Check 2: Is bg_subtractor valid? ---
+        if bg_subtractor is None:
+             print("[Parking Process] Error: ref_frame is set, but bg_subtractor is None!")
+             # Draw yellow boxes and return if subtractor invalid
+             for i, (start, end, status_tag, _) in enumerate(parking_areas):
+                 cv2.rectangle(processed_frame, start, end, (0, 255, 255), 2)
+                 cv2.putText(processed_frame, f"P{i+1}", (start[0], start[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+             cv2.putText(processed_frame, "Subtractor Error!", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+             return processed_frame, {"statuses": [ (tag, "Error") for _,_,tag,_ in parking_areas ]}
+
+        # --- Check 3: Can we get DPG values? ---
         try:
-            parking = frame[start_y:end_y, start_x:end_x]
-            if parking.size == 0:
-                print(f"Warning: Empty parking area {i}")
-                continue
-                
-            gray_parking = cv2.cvtColor(parking, cv2.COLOR_BGR2GRAY)
-            cars = car_cascade.detectMultiScale(
-                gray_parking,
-                scaleFactor=scale_factor,
-                minNeighbors=min_neighbors,
-                minSize=(30, 30)
-            )
+            current_history = dpg.get_value("history")
+            current_var_threshold = dpg.get_value("var_threshold")
+            obstruction_threshold = dpg.get_value("obstruction_percent")
+            bg_subtractor.setHistory(current_history)
+            bg_subtractor.setVarThreshold(current_var_threshold)
+            dpg_values_ok = True # Mark success
+        except Exception as e:
+            # Don't print constantly, maybe just once? Or use a flag.
+            # print(f"[Parking Process] DPG error getting values: {e}")
+            pass # Continue, but drawing might be affected if thresholds invalid
 
-            # Use background subtraction for obstruction detection
-            fg_mask = bg_subtractor.apply(parking)
+        gray_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2GRAY)
 
-            _, thresh = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-            white_pixels = cv2.countNonZero(thresh)
+        for i, (start, end, status_tag, _) in enumerate(parking_areas):
+            parking_roi = processed_frame[start[1]:end[1], start[0]:end[0]]
+            status_text = "Vacant" # Default
+            color = (0, 255, 0) # Default green
 
-            total_pixels = thresh.shape[0] * thresh.shape[1]
-            percent_change = (white_pixels / total_pixels) * 100
+            if parking_roi.size == 0: continue
 
-            # Use adjustable obstruction threshold
-            current_status = "Vacant"
-            color = (0, 255, 0)
-            if len(cars) > 0:
-                current_status = "Occupied"
-                color = (0, 0, 255)
-            elif percent_change > obstruction_percent:
-                current_status = "Obstructed"
-                color = (0, 165, 255)
+            if dpg_values_ok: # Only process if we got DPG values
+                try:
+                    fg_mask = bg_subtractor.apply(parking_roi, learningRate=0) # Use learningRate=0 for detection phase
+                    _, thresh = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+                    white_pixels = cv2.countNonZero(thresh)
+                    total_pixels = parking_roi.shape[0] * parking_roi.shape[1]
+                    obstruction_percent = (white_pixels / total_pixels) * 100 if total_pixels > 0 else 0
+                    is_obstructed = obstruction_percent > obstruction_threshold
 
-            # Update stabilization counters
-            for status in stabilization_counters[status_tag]:
-                if status == current_status:
-                    stabilization_counters[status_tag][status] += 1
+                    is_car_present = False
+                    if is_obstructed and car_cascade is not None:
+                        roi_gray = gray_frame[start[1]:end[1], start[0]:end[0]]
+                        cars = car_cascade.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+                        if len(cars) > 0:
+                            is_car_present = True
+                            # Optional: Draw car bounding box for debugging
+                            # for (x, y, w, h) in cars:
+                            #    cv2.rectangle(parking_roi, (x, y), (x+w, y+h), (255, 0, 0), 1)
+
+                    if is_car_present:
+                        status_text = "Occupied"
+                        color = (0, 0, 255)
+                    elif is_obstructed:
+                        status_text = "Obstructed"
+                        color = (0, 165, 255)
+
+                    statuses.append((status_tag, status_text))
+                    # --- Drawing happens here ---
+                    cv2.rectangle(processed_frame, start, end, color, 2)
+                    cv2.putText(processed_frame, f"P{i+1}: {status_text}", (start[0], start[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+                except Exception as e:
+                    print(f"Error processing parking ROI {i+1}: {e}")
+                    cv2.rectangle(processed_frame, start, end, (0, 255, 255), 2)
+                    cv2.putText(processed_frame, f"P{i+1}: Error", (start[0], start[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    statuses.append((status_tag, "Error"))
+            else:
+                 # Draw yellow if DPG values failed
+                 cv2.rectangle(processed_frame, start, end, (0, 255, 255), 2)
+                 cv2.putText(processed_frame, f"P{i+1}: DPG?", (start[0], start[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                 statuses.append((status_tag, "DPG?"))
+
+
+    else: # Draw initial yellow boxes if no ref frame
+        for i, (start, end, status_tag, _) in enumerate(parking_areas):
+             cv2.rectangle(processed_frame, start, end, (0, 255, 255), 2)
+             cv2.putText(processed_frame, f"P{i+1}", (start[0], start[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        if ref_frame is None: # Explicit check just for the text
+             cv2.putText(processed_frame, "Press 'S' to set reference frame", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+
+    if ref_frame is not None and bg_subtractor is not None:
+        try:
+            bg_subtractor.setHistory(dpg.get_value("history"))
+            bg_subtractor.setVarThreshold(dpg.get_value("var_threshold"))
+            obstruction_threshold = dpg.get_value("obstruction_percent")
+        except Exception as e:
+            print(f"DPG error getting values: {e}")
+            return processed_frame, None # Return early if GUI isn't ready
+
+        gray_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2GRAY) # Grayscale once for car detection
+
+        for i, (start, end, status_tag, _) in enumerate(parking_areas): # Unpack coords and tag
+            parking_roi = processed_frame[start[1]:end[1], start[0]:end[0]]
+            status_text = "Vacant" # Default
+            color = (0, 255, 0) # Default green
+
+            if parking_roi.size == 0: continue
+
+            try:
+                fg_mask = bg_subtractor.apply(parking_roi)
+                _, thresh = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+                white_pixels = cv2.countNonZero(thresh)
+                total_pixels = parking_roi.shape[0] * parking_roi.shape[1]
+                obstruction_percent = (white_pixels / total_pixels) * 100 if total_pixels > 0 else 0
+
+                is_obstructed = obstruction_percent > obstruction_threshold
+
+                # --- NEW: Check for car only if obstructed ---
+                is_car_present = False
+                if is_obstructed and car_cascade is not None:
+                    roi_gray = gray_frame[start[1]:end[1], start[0]:end[0]] # Use pre-grayed frame
+                    # Adjust minSize/maxSize based on expected car size in ROI
+                    cars = car_cascade.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+                    if len(cars) > 0:
+                        is_car_present = True
+
+                # --- Update Status based on Car Detection ---
+                if is_car_present:
+                    status_text = "Occupied"
+                    color = (0, 0, 255) # Red
+                elif is_obstructed:
+                    status_text = "Obstructed" # Something is there, but not a car
+                    color = (0, 165, 255) # Orange
+                # else: status remains Vacant, color remains Green
+
+                statuses.append((status_tag, status_text)) # Store status for GUI update
+                cv2.rectangle(processed_frame, start, end, color, 2)
+                cv2.putText(processed_frame, f"P{i+1}: {status_text}", (start[0], start[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            except Exception as e:
+                print(f"Error processing parking ROI {i+1}: {e}")
+                cv2.rectangle(processed_frame, start, end, (0, 255, 255), 2)
+                cv2.putText(processed_frame, f"P{i+1}: Error", (start[0], start[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                statuses.append((status_tag, "Error"))
+
+    else: # Draw boxes if no ref frame
+        for i, (start, end, status_tag, _) in enumerate(parking_areas):
+             cv2.rectangle(processed_frame, start, end, (0, 255, 255), 2)
+             cv2.putText(processed_frame, f"P{i+1}", (start[0], start[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        if ref_frame is None:
+             cv2.putText(processed_frame, "Press 'S' to set reference frame", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+
+    return processed_frame, {"statuses": statuses} # Pass statuses back
+
+# --- GUI Setup (Updated with Tabs and Duration Log) ---
+def setup_gui():
+    dpg.create_context()
+    parking_status_items = {} # Store dynamically created tags here
+
+    with dpg.window(label="System Control Panel", width=550, height=700, no_close=True):
+        with dpg.tab_bar():
+            # --- Entry Log Tab ---
+            # ... (no changes here) ...
+            with dpg.tab(label="Entry Log"):
+                 dpg.add_text("Vehicle Entries:")
+                 dpg.add_text("", tag="vehicle_log_entry", wrap=500)
+
+            # --- Exit Log Tab ---
+            # ... (no changes here) ...
+            with dpg.tab(label="Exit Log"):
+                 dpg.add_text("Vehicle Exits:")
+                 dpg.add_text("", tag="vehicle_log_exit", wrap=500)
+
+            # --- Duration Log Tab ---
+            # ... (no changes here) ...
+            with dpg.tab(label="Parking Duration"):
+                 dpg.add_text("Completed Stays:")
+                 dpg.add_text("", tag="duration_log", wrap=500)
+
+            # --- Parking Status Tab ---
+            # --- ADD TAG HERE ---
+            with dpg.tab(label="Parking Status", tag="parking_status_tab"): # Added tag
+                dpg.add_text("Parking Spot Status:")
+                # Status items will be added dynamically later using the tag as parent
+                dpg.add_separator()
+                dpg.add_text("Parking Detection Parameters")
+                dpg.add_slider_int(label="History", tag="history", default_value=500, min_value=100, max_value=2000)
+                dpg.add_slider_int(label="VarThreshold", tag="var_threshold", default_value=16, min_value=10, max_value=500)
+                dpg.add_slider_int(label="Obstruction %", tag="obstruction_percent", default_value=25, min_value=5, max_value=90)
+
+        # ... (Rest of setup_gui is unchanged) ...
+        dpg.add_separator()
+        dpg.add_text("Keyboard Controls")
+        dpg.add_text("Press 'S' (on any window) - Set Reference Frame")
+        dpg.add_text("Press 'Q' (on any window) - Quit")
+
+    dpg.create_viewport(title="Parking System", width=550, height=700)
+    dpg.setup_dearpygui()
+    dpg.show_viewport()
+    return parking_status_items # Return the dictionary to store tags
+
+# --- Main Application Logic ---
+# --- Main Application Logic ---
+if __name__ == "__main__":
+    parking_status_display_tags = setup_gui() # Setup GUI first
+
+    # ... (camera_configs setup unchanged) ...
+    camera_configs = {
+        "entry": {"source": 1, "processor": process_license_plate_frame},
+        "exit": {"source": 2, "processor": process_license_plate_frame},
+        "parking": {"source": 0, "processor": process_parking_frame}
+    }
+
+
+    print("Initializing parking area... waiting for camera frame.")
+    # ... (getting test_frame and calculating dimensions unchanged) ...
+    parking_cam_index = camera_configs["parking"]["source"]
+    temp_cap = cv2.VideoCapture(parking_cam_index)
+    ret, test_frame = temp_cap.read()
+    if ret:
+        frame_h, frame_w = test_frame.shape[:2]
+        print(f"Parking camera resolution: {frame_w}x{frame_h}")
+        parking_width = int(frame_w * 0.15)
+        parking_height = int(frame_h * 0.3)
+        start_x = int(frame_w * 0.05)
+        start_y = int(frame_h * 0.2)
+        space_between = int(parking_width * 0.1)
+
+        # --- MODIFIED: Use parent tag for adding status items ---
+        # No need to search for the tab anymore
+        parking_tab_exists = dpg.does_item_exist("parking_status_tab")
+
+        if parking_tab_exists:
+            for i in range(5): # Assuming 5 spots
+                start = (start_x + (parking_width + space_between) * i, start_y)
+                end = (start[0] + parking_width, start[1] + parking_height)
+                status_tag = f"parking_status_{i+1}"
+                # Add status text using the specific tab tag as parent
+                parking_status_display_tags[status_tag] = dpg.add_text(
+                    f"Parking {i+1:02d}: Initializing...",
+                    tag=status_tag,
+                    parent="parking_status_tab" # Use the tag here
+                )
+                parking_areas.append((start, end, status_tag, False))
+            print("Parking areas and GUI elements initialized.")
+        else:
+            print("[ERROR] Could not find item with tag 'parking_status_tab' to add status text items.")
+        # --- END MODIFIED SECTION ---
+
+        # ... (bg_subtractor initialization unchanged) ...
+        bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+             history=dpg.get_value("history"),
+             varThreshold=dpg.get_value("var_threshold"),
+             detectShadows=False
+        )
+    else:
+        # ... (error handling unchanged) ...
+        print(f"[FATAL] Could not get a test frame from the parking camera (index {parking_cam_index}). Exiting.")
+        if dpg.does_context_exist(): dpg.destroy_context()
+        exit()
+    temp_cap.release()
+
+    threads = []
+    output_queues = {}
+    for name, config in camera_configs.items():
+        output_queues[name] = Queue(maxsize=5) # Slightly larger queue
+        thread = Thread(target=camera_worker, args=(config["source"], output_queues[name], config["processor"], name), daemon=True)
+        threads.append(thread)
+        thread.start()
+
+    # --- Main Loop ---
+    try:
+        while dpg.is_dearpygui_running():
+            time.sleep(0.01) # Reduce CPU usage slightly more
+
+            all_data = {} # Store data from all cameras this cycle
+            # Process queues non-blockingly
+            for name, q in output_queues.items():
+                try:
+                    while not q.empty(): # Process all items in queue this cycle
+                        cam_name, frame, data = q.get_nowait()
+                        all_data[cam_name] = (frame, data) # Store latest frame & data
+                except Exception: # Handle queue empty exception
+                    pass
+
+            # --- Update GUI and State ---
+            log_updated = False
+            for cam_name, (frame, data) in all_data.items():
+                try:
+                    cv2.imshow(f"{cam_name.title()} Camera", frame)
+                except Exception as e:
+                    print(f"Error displaying frame for {cam_name}: {e}")
+
+                if data:
+                    # Handle Log data
+                    if "log" in data and "type" in data:
+                        log_updated = True
+                        log_msg = data["log"]
+                        log_type = data["type"]
+                        if log_type == "ENTRY":
+                            entry_log_messages.append(log_msg)
+                        elif log_type == "EXIT":
+                            exit_log_messages.append(log_msg)
+                            # Update duration log immediately when exit happens
+                            if dpg.does_item_exist("duration_log"):
+                                dpg.set_value("duration_log", "\n".join(duration_log_messages[-20:]))
+
+
+                    # Handle Parking Status data
+                    if "statuses" in data:
+                         for status_tag, status_text in data["statuses"]:
+                              if dpg.does_item_exist(status_tag):
+                                   dpg.set_value(status_tag, f"Parking {status_tag.split('_')[-1]}: {status_text}")
+
+
+            # Update log displays if needed (outside the camera loop)
+            if log_updated:
+                 if dpg.does_item_exist("vehicle_log_entry"):
+                      dpg.set_value("vehicle_log_entry", "\n".join(entry_log_messages[-20:])) # Show last 20
+                 if dpg.does_item_exist("vehicle_log_exit"):
+                      dpg.set_value("vehicle_log_exit", "\n".join(exit_log_messages[-20:]))
+                 if dpg.does_item_exist("duration_log"): # Ensure duration updates even if no exit this cycle
+                      dpg.set_value("duration_log", "\n".join(duration_log_messages[-20:]))
+
+
+            if dpg.is_dearpygui_running():
+                dpg.render_dearpygui_frame()
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                dpg.stop_dearpygui(); break
+            elif key == ord('s'):
+                if latest_parking_frame is not None:
+                    print("Setting new reference frame...")
+                    ref_frame = latest_parking_frame.copy()
+                    bg_subtractor = cv2.createBackgroundSubtractorMOG2( # Recreate to reset history
+                        history=dpg.get_value("history"),
+                        varThreshold=dpg.get_value("var_threshold"),
+                        detectShadows=False
+                    )
+                    print("Reference frame for parking lot has been set!")
                 else:
-                    stabilization_counters[status_tag][status] = max(0, stabilization_counters[status_tag][status] - 1)
+                    print("Could not set reference frame: No frame available from parking camera.")
 
-            # Confirm the status change only if it persists for the stabilization threshold
-            if stabilization_counters[status_tag][current_status] >= stabilization_threshold:
-                if previous_status[status_tag] != current_status:
-                    # Log parking duration when switching from "Occupied" to "Vacant"
-                    if previous_status[status_tag] == "Occupied" and current_status == "Vacant":
-                        parking_end_time[status_tag] = time.time()
-                        duration = parking_end_time[status_tag] - parking_start_time[status_tag]
-                        if duration >= 10:  # Only log if occupied for 10 seconds or more for guaranteed parking 
-                            # Convert duration to h:m:s
-                            hours = int(duration // 3600)
-                            minutes = int((duration % 3600) // 60)
-                            seconds = int(duration % 60)
-                            log_entry = f"Parking {i:02} was occupied for {hours:02}:{minutes:02}:{seconds:02}."
-                            print(log_entry)
-                            log_messages.append(log_entry)
-                            # Keep only the last 10 log entries
-                            if len(log_messages) > 10:
-                                log_messages.pop(0)
-                            dpg.set_value("parking_log", "\n".join(log_messages))
-                            date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-                            with open(f"parking_log_{date_str}.txt", "a") as logfile:
-                                logfile.write(log_entry + "\n")
-                        else:
-                            pass
+    finally:
+        print("Shutting down...")
+        stop_event.set() # Signal threads to stop
+        # Give threads a moment to finish
+        time.sleep(1)
+        for t in threads:
+            if t.is_alive():
+                 print(f"Waiting for thread {t.name} to join...")
+                 t.join(timeout=2) # Wait max 2 seconds per thread
+                 if t.is_alive(): print(f"Warning: Thread {t.name} did not terminate gracefully.")
 
-                    # Start tracking time when switching to "Occupied"
-                    if current_status == "Occupied":
-                        parking_start_time[status_tag] = time.time()
+        cv2.destroyAllWindows()
+        if dpg.is_dearpygui_running(): # Check before destroying
+             dpg.stop_dearpygui()
+        if dpg.does_context_exist():
+            dpg.destroy_context()
 
-                    previous_status[status_tag] = current_status
-
-                    # Play sound only when the status changes
-                    pygame.mixer.stop()
-                    if current_status == "Occupied":
-                        pass  
-                    elif current_status == "Obstructed":
-                        obstructed_sound.play()
-                    elif current_status == "Vacant":
-                        vacant_sound.play()
-
-            display_text = f"Parking {i:02}: {previous_status[status_tag]}"
-            if previous_status[status_tag] == "Occupied" and parking_start_time[status_tag] is not None:
-                elapsed = int(time.time() - parking_start_time[status_tag])
-                hours = elapsed // 3600
-                minutes = (elapsed % 3600) // 60
-                seconds = elapsed % 60
-                display_text += f" [{hours:02}:{minutes:02}:{seconds:02}]"
-            dpg.set_value(status_tag, display_text)
-
-            cv2.rectangle(frame, start, end, color, 2)
-            cv2.putText(frame, previous_status[status_tag], (start[0], start[1] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        except cv2.error as e:
-            print(f"Error processing parking area {i}: {e}")
-            continue
-
-    cv2.imshow("Parking Scanner", frame)
-
-    # Process entry view (using the same frame)
-    if entry_frame is not None:
-        entry_frame, plate_text = plate_detector.process_frame(entry_frame)
-        if plate_text and plate_text not in vehicles:
-            vehicles[plate_text] = {
-                "entry_time": datetime.datetime.now(),
-                "exit_time": None
-            }
-            log_entry = f"Vehicle {plate_text} entered at {vehicles[plate_text]['entry_time'].strftime('%H:%M:%S')}"
-            log_messages.append(log_entry)
-        
-        cv2.imshow("Entry Camera", entry_frame)
-
-    # Process exit view (using the same frame)
-    if exit_frame is not None:
-        exit_frame, plate_text = plate_detector.process_frame(exit_frame)
-        if plate_text and plate_text in vehicles and vehicles[plate_text]["exit_time"] is None:
-            vehicles[plate_text]["exit_time"] = datetime.datetime.now()
-            duration = vehicles[plate_text]["exit_time"] - vehicles[plate_text]["entry_time"]
-            log_entry = f"Vehicle {plate_text} exited at {vehicles[plate_text]['exit_time'].strftime('%H:%M:%S')} (Duration: {duration})"
-            log_messages.append(log_entry)
-        
-        cv2.imshow("Exit Camera", exit_frame)
-
-    # Update vehicle log display
-    if log_messages:
-        dpg.set_value("vehicle_log", "\n".join(log_messages[-10:]))  # Show last 10 logs
-
-    # Save vehicle data to JSON file
-    with open("vehicle_log.json", "w") as f:
-        json_data = {k: {
-            "entry_time": v["entry_time"].strftime("%Y-%m-%d %H:%M:%S") if v["entry_time"] else None,
-            "exit_time": v["exit_time"].strftime("%Y-%m-%d %H:%M:%S") if v["exit_time"] else None
-        } for k, v in vehicles.items()}
-        json.dump(json_data, f, indent=4)
-
-    if key == ord('q'):
-        break
-
-    dpg.render_dearpygui_frame()
-
-cap.release()
-cv2.destroyAllWindows()
-dpg.destroy_context()
+        # Log saving is handled by atexit
+        print("Shutdown sequence complete.") # Keep this AFTER DPG destroy

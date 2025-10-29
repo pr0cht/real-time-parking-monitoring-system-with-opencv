@@ -1,0 +1,34 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Training Data Folders (Too large for Git)
+plate_trainer/datasets/
+plate_trainer/positive_raw/
+plate_trainer/negative_images/
+my_negative_images/
+
+# Intermediate/Generated Training Files
+plate_trainer/positives.txt
+plate_trainer/negatives.txt
+plate_trainer/positives.vec
+plate_trainer/runs/ # Ignore all training output runs
+*.cache # Ultralytics cache files
+
+# IDE/Editor specific folders
+.idea/
+.vscode/
+
+# Log files / Generated data
+*.log
+parking_log_*.txt
+vehicle_log.json # Usually ignored unless you specifically want to sync this history
+
+# Downloaded OpenCV build (if you kept it)
+opencv*/ # Ignore the extracted OpenCV folders
